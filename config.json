@@ -1,0 +1,7 @@
+{
+    "bot_token": "PASTE_YOUR_TOKEN_HERE",
+    "web_port": 5000,
+    "web_password": "password",
+    "default_channel_id": 1460457001984331849,
+    "timezone_offset": 0
+}
