@@ -7,35 +7,56 @@ import json
 import threading
 import asyncio
 import time
+import sys
 
 # --- CONFIGURATION LOAD ---
-with open('config.json', 'r') as f:
-    config = json.load(f)
-
-TOKEN = config['bot_token']
-PORT = config['web_port']
-WEB_PASS = config['web_password']
-DEFAULT_CID = config['default_channel_id']
+try:
+    with open('config.json', 'r') as f:
+        config = json.load(f)
+    TOKEN = config['bot_token']
+    PORT = config['web_port']
+    WEB_PASS = config['web_password']
+    DEFAULT_CID = config['default_channel_id']
+except FileNotFoundError:
+    print("❌ FATAL: 'config.json' not found. Please create it.")
+    sys.exit(1)
+except KeyError as e:
+    print(f"❌ FATAL: Missing key in config.json: {e}")
+    sys.exit(1)
 
 # --- SHARED STATE ---
-# The bot will update this list, and Flask will read it.
 known_channels = []
+known_roles = []
 
 # --- DATABASE SETUP ---
 DB_FILE = "scheduler.db"
 
 
+def log(msg, level="INFO"):
+    """Simple logger with timestamps."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {msg}")
+
+
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS queue
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  message TEXT,
-                  send_time TEXT,
-                  channel_id INTEGER,
-                  channel_name TEXT)''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        # Added 'role_id' and 'role_name' columns
+        c.execute('''CREATE TABLE IF NOT EXISTS queue
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      message TEXT,
+                      send_time TEXT,
+                      channel_id INTEGER,
+                      channel_name TEXT,
+                      role_id INTEGER,
+                      role_name TEXT)''')
+        conn.commit()
+        conn.close()
+        log("Database connected and checked.")
+    except sqlite3.Error as e:
+        log(f"Database initialization failed: {e}", "CRITICAL")
+        sys.exit(1)
 
 
 # --- FLASK WEB SERVER ---
@@ -48,7 +69,7 @@ HTML_TEMPLATE = """
     <title>Discord Scheduler</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        :root { --bg: #2c2f33; --panel: #23272a; --input: #40444b; --text: #fff; --primary: #7289da; --danger: #f04747; --success: #43b581; }
+        :root { --bg: #2c2f33; --panel: #23272a; --input: #40444b; --text: #fff; --primary: #7289da; --danger: #f04747; --success: #43b581; --warning: #faa61a; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
         .container { width: 100%; max-width: 800px; display: grid; grid-template-columns: 1fr; gap: 20px; }
         @media(min-width: 768px) { .container { grid-template-columns: 1fr 1fr; } }
@@ -64,12 +85,13 @@ HTML_TEMPLATE = """
         .msg-item { background: var(--input); margin-bottom: 10px; padding: 15px; border-radius: 6px; border-left: 4px solid var(--success); position: relative; }
         .msg-meta { font-size: 0.85em; color: #99aab5; margin-bottom: 5px; display: flex; justify-content: space-between;}
         .msg-content { font-size: 1em; white-space: pre-wrap; word-break: break-word;}
+        .ping-badge { background: #7289da; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; margin-right: 5px; }
         .delete-btn { background: var(--danger); width: auto; padding: 5px 10px; font-size: 0.8em; position: absolute; top: 10px; right: 10px; }
         .delete-btn:hover { background: #c03535; }
 
-        .flash { padding: 10px; border-radius: 4px; margin-bottom: 20px; text-align: center; }
-        .flash.success { background: rgba(67, 181, 129, 0.2); border: 1px solid var(--success); }
-        .flash.error { background: rgba(240, 71, 71, 0.2); border: 1px solid var(--danger); }
+        .flash { padding: 10px; border-radius: 4px; margin-bottom: 20px; text-align: center; font-weight: bold; }
+        .flash.success { background: rgba(67, 181, 129, 0.2); border: 1px solid var(--success); color: var(--success); }
+        .flash.error { background: rgba(240, 71, 71, 0.2); border: 1px solid var(--danger); color: var(--danger); }
     </style>
 </head>
 <body>
@@ -96,6 +118,16 @@ HTML_TEMPLATE = """
                     {% endfor %}
                 </select>
 
+                <label>Ping Role (Optional)</label>
+                <select name="role_select">
+                    <option value="none">-- No Ping --</option>
+                    <option value="everyone">@everyone</option>
+                    <option value="here">@here</option>
+                    {% for r in roles %}
+                        <option value="{{ r.id }}|{{ r.name }}">{{ r.name }}</option>
+                    {% endfor %}
+                </select>
+
                 <label>Message</label>
                 <textarea name="content" rows="5" required placeholder="Type your announcement here..."></textarea>
 
@@ -116,7 +148,7 @@ HTML_TEMPLATE = """
                             <span>📅 {{ item.time }}</span>
                             <span>#{{ item.ch_name }}</span>
                         </div>
-                        <div class="msg-content">{{ item.msg }}</div>
+                        <div class="msg-content">{% if item.role_name %}<span class="ping-badge">@{{ item.role_name }}</span>{% endif %}{{ item.msg }}</div>
                         <form method="POST" action="/delete" style="margin:0;">
                              <input type="hidden" name="password" value="{{ last_pass }}">
                              <input type="hidden" name="id" value="{{ item.id }}">
@@ -137,71 +169,100 @@ HTML_TEMPLATE = """
 
 @app.route('/', methods=['GET', 'POST'])
 def home():
-    # 1. Check if we just loaded the page with a success message in the URL
     status_msg = request.args.get('msg', "")
     status_type = request.args.get('type', "")
     last_pass = ""
 
-    # 2. Handle the Form Submission
     if request.method == 'POST':
         last_pass = request.form.get('password')
 
-        # Password Check
         if last_pass != WEB_PASS:
-            status_msg = "Wrong Password!"
+            status_msg = "⛔ Incorrect Password"
             status_type = "error"
         else:
-            # Gather Data
             message = request.form.get('content')
             raw_time = request.form.get('datetime')
             raw_channel = request.form.get('channel_select')
+            raw_role = request.form.get('role_select')
 
-            # Channel Logic
+            # Parse Channel
             if raw_channel:
-                ch_data = raw_channel.split('|')
-                channel_id = ch_data[0]
-                channel_name = ch_data[1] if len(ch_data) > 1 else "Unknown"
+                try:
+                    ch_data = raw_channel.split('|')
+                    channel_id = ch_data[0]
+                    channel_name = ch_data[1] if len(ch_data) > 1 else "Unknown"
+                except Exception:
+                    channel_id = DEFAULT_CID
+                    channel_name = "Default (Parse Error)"
             else:
                 channel_id = DEFAULT_CID
                 channel_name = "Default"
+
+            # Parse Role
+            role_id = None
+            role_name = None
+
+            if raw_role == "everyone":
+                role_id = "everyone"
+                role_name = "everyone"
+            elif raw_role == "here":
+                role_id = "here"
+                role_name = "here"
+            elif raw_role and raw_role != "none":
+                try:
+                    r_data = raw_role.split('|')
+                    role_id = r_data[0]
+                    role_name = r_data[1] if len(r_data) > 1 else "Role"
+                except:
+                    role_id = None
 
             # Save to DB
             if message and raw_time:
                 try:
                     conn = sqlite3.connect(DB_FILE)
                     c = conn.cursor()
-                    c.execute("INSERT INTO queue (message, send_time, channel_id, channel_name) VALUES (?, ?, ?, ?)",
-                              (message, raw_time, channel_id, channel_name))
+                    c.execute(
+                        "INSERT INTO queue (message, send_time, channel_id, channel_name, role_id, role_name) VALUES (?, ?, ?, ?, ?, ?)",
+                        (message, raw_time, channel_id, channel_name, role_id, role_name))
                     conn.commit()
                     conn.close()
+                    log(f"WebUI: Scheduled message for {channel_name} at {raw_time}")
+                    return redirect(url_for('home', msg="✅ Message Scheduled!", type="success"))
 
-                    # --- THE CRITICAL FIX ---
-                    # Instead of showing the page immediately, we REDIRECT the browser.
-                    # This clears the "form submission" memory.
-                    return redirect(url_for('home', msg="Message Scheduled!", type="success"))
-
-                except Exception as e:
-                    status_msg = f"Database Error: {e}"
+                except sqlite3.OperationalError as e:
+                    status_msg = f"❌ Database Locked/Error: {e}"
                     status_type = "error"
+                    log(f"WebUI DB Error: {e}", "ERROR")
+                except Exception as e:
+                    status_msg = f"❌ Unexpected Error: {e}"
+                    status_type = "error"
+                    log(f"WebUI Unknown Error: {e}", "ERROR")
 
-    # 3. Load the Queue for display (happens on every load/refresh)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, message, send_time, channel_name FROM queue ORDER BY send_time ASC")
-    rows = c.fetchall()
-    conn.close()
+    # Fetch Queue
+    queue_data = []
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, message, send_time, channel_name, role_name FROM queue ORDER BY send_time ASC")
+        rows = c.fetchall()
+        conn.close()
+        queue_data = [{'id': r[0], 'msg': r[1], 'time': r[2].replace('T', ' '), 'ch_name': r[3], 'role_name': r[4]} for
+                      r in rows]
+    except sqlite3.Error as e:
+        log(f"Failed to fetch queue: {e}", "ERROR")
 
-    queue_data = [{'id': r[0], 'msg': r[1], 'time': r[2].replace('T', ' '), 'ch_name': r[3]} for r in rows]
     server_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return render_template_string(HTML_TEMPLATE,
                                   msg=status_msg,
                                   type=status_type,
                                   channels=known_channels,
+                                  roles=known_roles,
                                   queue=queue_data,
                                   default_cid=DEFAULT_CID,
                                   server_time=server_time,
                                   last_pass=last_pass)
+
 
 @app.route('/delete', methods=['POST'])
 def delete_msg():
@@ -209,11 +270,16 @@ def delete_msg():
         return "Wrong Password"
 
     msg_id = request.form.get('id')
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM queue WHERE id = ?", (msg_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM queue WHERE id = ?", (msg_id,))
+        conn.commit()
+        conn.close()
+        log(f"WebUI: Deleted message ID {msg_id}")
+    except sqlite3.Error as e:
+        log(f"Failed to delete message: {e}", "ERROR")
+
     return redirect(url_for('home'))
 
 
@@ -226,48 +292,86 @@ def run_flask():
 
 # --- DISCORD BOT ---
 intents = discord.Intents.default()
-intents.guilds = True  # Required to see channel lists
+intents.guilds = True
+intents.members = True  # Needed to see members/roles properly sometimes
 
 client = discord.Client(intents=intents)
 
 
 @tasks.loop(minutes=1)
-async def update_channel_list():
-    """Updates the global list of channels for the dropdown."""
+async def update_discord_data():
+    """Updates the global list of channels AND roles."""
     global known_channels
-    temp_list = []
-    # Loop through all servers (guilds) the bot is in
-    for guild in client.guilds:
-        for channel in guild.text_channels:
-            if channel.permissions_for(guild.me).send_messages:
-                temp_list.append({'id': channel.id, 'name': f"{guild.name} - {channel.name}"})
-    known_channels = temp_list
-    # If list is empty, user might not have invited bot yet
-    if not known_channels:
-        print("[WARN] No channels found. Is the bot in a server?")
+    global known_roles
+
+    # 1. Update Channels
+    temp_channels = []
+    temp_roles = []
+
+    try:
+        for guild in client.guilds:
+            # Channels
+            for channel in guild.text_channels:
+                if channel.permissions_for(guild.me).send_messages:
+                    temp_channels.append({'id': channel.id, 'name': f"{guild.name} - {channel.name}"})
+
+            # Roles (Filter out managed/bot roles usually)
+            for role in guild.roles:
+                if not role.is_default() and not role.managed:
+                    temp_roles.append({'id': role.id, 'name': f"{guild.name} - {role.name}"})
+
+        known_channels = temp_channels
+        known_roles = temp_roles
+
+    except Exception as e:
+        log(f"Error updating discord data: {e}", "WARN")
 
 
 @tasks.loop(seconds=30)
 async def check_schedule():
     current_time = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, message, channel_id FROM queue WHERE send_time <= ?", (current_time,))
-    rows = c.fetchall()
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, message, channel_id, role_id FROM queue WHERE send_time <= ?", (current_time,))
+        rows = c.fetchall()
+    except sqlite3.Error as e:
+        log(f"DB Error checking schedule: {e}", "ERROR")
+        return
 
     for row in rows:
-        msg_id, msg_content, cid = row
+        msg_id, msg_content, cid, role_id = row
+
+        # Construct the ping
+        ping_str = ""
+        if role_id == "everyone":
+            ping_str = "@everyone "
+        elif role_id == "here":
+            ping_str = "@here "
+        elif role_id:  # It's a specific ID
+            ping_str = f"<@&{role_id}> "
+
+        final_message = f"{ping_str}{msg_content}"
+
         try:
             channel = client.get_channel(int(cid))
             if channel:
-                await channel.send(msg_content)
-                print(f"[SENT] Message to {cid}")
+                await channel.send(final_message)
+                log(f"✅ SENT message to channel {cid} with ping {role_id}")
             else:
-                print(f"[ERROR] Could not find channel {cid}")
-        except Exception as e:
-            print(f"[ERROR] Failed to send: {e}")
+                log(f"❌ FAILED: Channel {cid} not found", "ERROR")
 
-        c.execute("DELETE FROM queue WHERE id = ?", (msg_id,))
+        except discord.Forbidden:
+            log(f"⛔ PERMISSION DENIED: Cannot send to channel {cid}.", "ERROR")
+        except Exception as e:
+            log(f"❌ UNKNOWN ERROR sending to {cid}: {e}", "ERROR")
+
+        # Cleanup
+        try:
+            c.execute("DELETE FROM queue WHERE id = ?", (msg_id,))
+        except sqlite3.Error as e:
+            log(f"Failed to remove sent message from DB: {e}", "CRITICAL")
 
     conn.commit()
     conn.close()
@@ -275,15 +379,17 @@ async def check_schedule():
 
 @client.event
 async def on_ready():
-    print(f'Logged in as {client.user}')
+    log(f'Logged in as {client.user}')
     init_db()
     check_schedule.start()
-    update_channel_list.start()
+    update_discord_data.start()
 
 
-# --- MAIN ---
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    client.run(TOKEN)
+    try:
+        client.run(TOKEN)
+    except Exception as e:
+        print(f"\n❌ CRITICAL: Failed to start bot: {e}")
